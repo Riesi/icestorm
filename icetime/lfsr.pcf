@@ -1,0 +1,21 @@
+set_io test_in1 4
+
+set_io clk 35
+
+set_io chal[0] 2
+set_io chal[1] 47
+set_io chal[2] 45
+set_io chal[3] 43
+set_io chal[4] 39
+set_io chal[5] 34
+set_io chal[6] 31
+
+
+set_io test_out1 3
+set_io test_out1[1] 48
+set_io test_out1[2] 46
+set_io test_out1[3] 44
+set_io test_out1[4] 42
+set_io test_out1[5] 36
+set_io test_out1[6] 32
+set_io test_out1[7] 28

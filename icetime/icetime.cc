@@ -807,6 +807,7 @@ struct TimingAnalysis
 	std::map<std::string, std::tuple<std::string, std::string, std::string, std::string, double>> net_max_path_parent;
 
 	std::map<std::string, double> net_max_path_delay;
+	std::map<std::string, std::tuple<double, double>> net_path_delay;
 	std::string global_max_path_net;
 	double global_max_path_delay;
 
@@ -835,8 +836,8 @@ struct TimingAnalysis
 				net_max_path_delay[net] = get_delay(driver_type, "*clkedge*", driver_port) + GLOBAL_CLK_DIST_JITTER;
 			return net_max_path_delay[net];
 		}
-
-		for (auto &inport : get_inports(driver_type))
+		auto inports = get_inports(driver_type);
+		for (auto &inport : inports)
 		{
 			if (inport == "clk" || inport == "INPUTCLK" || inport == "OUTPUTCLK" || inport == "PADIN")
 				continue;
@@ -991,7 +992,7 @@ struct TimingAnalysis
 			delay += std::get<0>(user);
 			std::string outnet, outnethw, outnetsym;
 
-			auto &inports = get_inports(netlist_cell_types.at(std::get<1>(user)));
+			auto inports = get_inports(netlist_cell_types.at(std::get<1>(user)));
 
 			for (auto &it : netlist_cell_ports.at(std::get<1>(user)))
 			{
@@ -1139,6 +1140,130 @@ struct TimingAnalysis
 
 		return delay;
 	}
+	//-------------------------------------------------------------------------------------------
+	std::tuple<double, double> calc_net_path_delay(const std::string &net)
+	{
+		if (net_path_delay.count(net))
+			return net_path_delay.at(net);
+
+		if (net_driver.count(net) == 0)
+			return std::make_tuple(0.0, -1e6);
+
+		double max_path_delay = -1e6;
+		net_path_delay[net] = std::make_tuple(1e6, -1e6);
+
+		auto &driver_cell = net_driver.at(net).first;
+		auto &driver_port = net_driver.at(net).second;
+		auto &driver_type = netlist_cell_types.at(driver_cell);
+
+		if (is_primary(driver_cell, driver_port)) {
+			double del;
+			if (interior_timing && driver_type == "PRE_IO")
+				del = -1e3;
+			else
+				del = get_delay(driver_type, "*clkedge*", driver_port) + GLOBAL_CLK_DIST_JITTER;
+			net_path_delay[net] = std::make_tuple(del, del);
+			return net_path_delay[net];
+		}
+		double first_this_cell_delay = -1e6;//wrong doesnt grab cell delay
+		auto inports = get_inports(driver_type);
+		for (auto &inport : inports)
+		{
+			if (inport == "clk" || inport == "INPUTCLK" || inport == "OUTPUTCLK" || inport == "PADIN")
+				continue;
+
+			if (driver_type == "LogicCell40" && driver_port == "carryout") {
+				if (inport == "in0" || inport == "in3" || inport == "ce" || inport == "sr")
+					continue;
+			}
+
+			if (driver_type == "LogicCell40" && (driver_port == "ltout" || driver_port == "lcout")) {
+				if (inport == "carryin")
+					continue;
+			}
+
+			if (driver_type == "LogicCell40" && driver_port == "ltout") {
+				if (inport == "ce" || inport == "sr")
+					continue;
+			}
+
+			std::string *in_net = &netlist_cell_ports.at(driver_cell).at(inport);
+			while (net_assignments.count(*in_net))
+				in_net = &net_assignments.at(*in_net);
+
+			if (*in_net == "" || *in_net == "vcc" || *in_net == "gnd")
+				continue;
+
+			double this_cell_delay = get_delay(driver_type, inport, driver_port);
+			if (first_this_cell_delay < 0){
+				first_this_cell_delay = this_cell_delay;
+			}
+			double max_del, this_del;
+			std::tie(max_del, this_del) = calc_net_path_delay(*in_net);
+			double this_path_delay = max_del + this_cell_delay;
+
+			if (this_path_delay >= max_path_delay) {
+				net_max_path_parent[net] = std::make_tuple(*in_net, driver_cell, inport, driver_port, this_cell_delay);
+				max_path_delay = this_path_delay;
+			}
+		}
+
+		net_path_delay[net] = std::make_tuple(max_path_delay, first_this_cell_delay);
+		return net_path_delay.at(net);
+	}// TODO cascademuxed returns 0 delay
+	
+	std::set<std::string> interior_timing_println()
+	{
+		std::set<std::string> all_nets;
+
+		for (auto &it : netlist_cell_ports)
+		for (auto &it2 : it.second)
+		{
+			auto &cell_name = it.first;
+			auto &port_name = it2.first;
+			auto &net_name = it2.second;
+
+			if (net_name == "")
+				continue;
+
+			auto &cell_type = netlist_cell_types.at(cell_name);
+
+			if (get_inports(cell_type).count(port_name)) {
+				std::string n = net_name;
+				while (1) {
+					double setup_time = get_delay(cell_type, port_name, "*setup*");
+					if (setup_time >= std::get<0>(net_max_setup[n]))
+						net_max_setup[n] = std::make_tuple(setup_time, cell_name, port_name);
+					if (net_assignments.count(n) == 0)
+						break;
+					n = net_assignments.at(n);
+				}
+				if (interior_timing && cell_type != "PRE_IO" && is_primary(cell_name, "lcout"))
+					mark_interior(net_name);
+				continue;
+			}
+
+			net_driver[net_name] = { cell_name, port_name };
+			all_nets.insert(net_name);
+		}
+				global_max_path_delay = 0;
+
+		for (auto &net : all_nets) {
+			if (interior_timing && interior_nets.count(net) == 0)
+				continue;
+			double max_del, this_del;
+			std::tie(max_del, this_del) = calc_net_path_delay(net);
+			double d = max_del + std::get<0>(net_max_setup[net]);
+
+			if (d > global_max_path_delay) {
+				global_max_path_delay = d;
+				global_max_path_net = net;
+			}
+		}
+		
+		return all_nets;
+	}
+	//-------------------------------------------------------------------------------------------
 };
 
 void register_interconn_src(int x, int y, int net)
@@ -2276,6 +2401,9 @@ void help(const char *cmd)
 	printf("    -T <net_name>\n");
 	printf("        print a timing report for the specified net\n");
 	printf("\n");
+	printf("    -A\n");
+	printf("        print a timing report for all nets\n");
+	printf("\n");
 	printf("    -N\n");
 	printf("        list valid net names for -T <net_name>\n");
 	printf("\n");
@@ -2304,12 +2432,13 @@ int main(int argc, char **argv)
 
 	bool listnets = false;
 	bool print_timing = false;
+	bool print_timing_all_nets = false;
 	bool interior_timing = false;
 	double clock_constr = 0;
 	std::vector<std::string> print_timing_nets;
 
 	int opt;
-	while ((opt = getopt(argc, argv, "p:P:g:o:r:j:d:mitT:Nvc:C:")) != -1)
+	while ((opt = getopt(argc, argv, "p:P:g:o:r:j:d:mitT:ANvc:C:")) != -1)
 	{
 		switch (opt)
 		{
@@ -2363,6 +2492,9 @@ int main(int argc, char **argv)
 			break;
 		case 'T':
 			print_timing_nets.push_back(optarg);
+			break;
+		case 'A':
+			print_timing_all_nets = true;
 			break;
 		case 'N':
 			listnets = true;
@@ -2641,7 +2773,7 @@ device_chip_mismatch:
 	if (fjson)
 		fprintf(fjson, "[\n");
 
-	if (print_timing || listnets || !print_timing_nets.empty())
+	if (print_timing || print_timing_all_nets || listnets || !print_timing_nets.empty())
 	{
 		TimingAnalysis ta(interior_timing);
 
@@ -2649,26 +2781,44 @@ device_chip_mismatch:
 			frpt = stdout;
 		else
 			printf("// Timing estimate: %.2f ns (%.2f MHz)\n", ta.global_max_path_delay, 1000.0 / ta.global_max_path_delay);
-
+		
 		fprintf(frpt, "\n");
 		fprintf(frpt, "icetime topological timing analysis report\n");
 		fprintf(frpt, "==========================================\n");
 		fprintf(frpt, "\n");
-
 		if (max_span_hack) {
 			fprintf(frpt, "Info: max_span_hack is enabled: estimate is conservative.\n");
 			fprintf(frpt, "\n");
 		}
 
-		for (auto &n : print_timing_nets)
+		for (auto &n : print_timing_nets){
 			max_path_delay = std::max(max_path_delay, ta.report(n));
+		}
 
-		if (print_timing)
+		if (print_timing){
 			max_path_delay = ta.report();
+		}
 
 		if (listnets)
 			for (auto &it : ta.net_max_path_delay)
 				fprintf(frpt, "%s\n", it.first.c_str());
+		
+		if (print_timing_all_nets){
+			auto all_nets = ta.interior_timing_println();
+			for (auto &net : all_nets) {
+				double max_del, this_del;
+				std::tie(max_del, this_del) = ta.calc_net_path_delay(net);
+				
+				int netidx;
+				char dummy_ch;
+				std::string net_name = "Net-Name";
+				if (sscanf(net.c_str(), "net_%d%c", &netidx, &dummy_ch) == 1 && net_symbols.count(netidx)) {
+					net_name = net_symbols[netidx];
+				}
+				
+				fprintf(frpt, "%s: %s -> %lf (max %lf)\n", net_name.c_str(), net.c_str(), this_del, max_del);
+			}
+		}
 	}
 	else
 	{

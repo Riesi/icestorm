@@ -74,3 +74,5 @@ clean:
 
 .PHONY: all install uninstall clean
 
+te:
+	./icetime lfsr.asc -p lfsr.pcf -C 5k_bla.db -P sg48 -d up5k -A
